@@ -1,4 +1,4 @@
-// Biudzeto knygos backend serveris.
+// Biudzeto knygos / smalllabs-api backend serveris.
 //
 // SAUGUMO PRINCIPAI, kuriu laikomasi siame faile:
 // 1. Slaptazodziai NIEKADA nesaugomi ir nesiunciami kaip tekstas - tik bcrypt "hash".
@@ -10,8 +10,11 @@
 //    kad piktavalis negaletu "surinkti" registruotu vartotoju sarasa.
 // 5. Visi slapti raktai (DB rysys, JWT paslaptis) ateina is Environment Variables,
 //    niekada nerasomi i pati koda.
+// 6. Helmet.js prideda saugumo HTTP antrastes (OWASP rekomendacija).
+// 7. Rate limiting apsaugo nuo brute-force atakų prisijungimo/registracijos endpoint'uose.
 
 const express = require("express");
+const helmet = require("helmet");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
@@ -19,6 +22,8 @@ const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 
 const app = express();
+
+app.use(helmet());
 
 // CORS: leidziame uzklausas is BET KURIO *.smalllabs.lt poddomenio (ir paties smalllabs.lt),
 // kad viena paskyra veiktu visose programelese. Kitos kilmes (originai) atmetamos.
@@ -46,20 +51,19 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const BCRYPT_ROUNDS = 12; // kiek kartu maisomas slaptazodis - kuo daugiau, tuo saugiau, bet leciau
+const BCRYPT_ROUNDS = 12;
 
 if (!JWT_SECRET) {
   console.error("KLAIDA: trūksta JWT_SECRET aplinkos kintamojo. Serveris nesileis.");
   process.exit(1);
 }
 
-// --- Pagalbine funkcija: paprastas el. pasto formato patikrinimas ---
 function isValidEmail(email) {
   return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "Biudžeto knygos backend veikia." });
+  res.json({ status: "ok", message: "smalllabs-api veikia." });
 });
 
 app.get("/api/health", async (req, res) => {
@@ -103,8 +107,6 @@ app.post("/api/register", authLimiteris, async (req, res) => {
     }
 
     const password_hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    // Jei registruojamasi su ADMIN_EMAIL nurodytu el. pastu, paskyra automatiskai
-    // gauna pilna (is_admin) prieiga - be prenumeratos, be mokejimo.
     const isAdmin = process.env.ADMIN_EMAIL && email.toLowerCase() === process.env.ADMIN_EMAIL.toLowerCase();
     const result = await pool.query(
       "INSERT INTO users (email, password_hash, is_admin) VALUES ($1, $2, $3) RETURNING id, email, is_admin, created_at",
@@ -123,7 +125,6 @@ app.post("/api/login", authLimiteris, async (req, res) => {
   const { email, password } = req.body;
 
   if (!isValidEmail(email) || typeof password !== "string") {
-    // Tyciotai neaiskus pranesimas - nesakome, ar problema el. pastas, ar slaptazodis.
     return res.status(400).json({ klaida: "Neteisingas el. paštas arba slaptažodis." });
   }
 
@@ -142,11 +143,11 @@ app.post("/api/login", authLimiteris, async (req, res) => {
     const token = jwt.sign({ userId: vartotojas.id }, JWT_SECRET, { expiresIn: "7d" });
 
     res.cookie("session", token, {
-      httpOnly: true, // kenkejiskas JS naršykleje negali perskaityti sio slapuko
-      secure: true, // siunciamas tik per HTTPS
-      sameSite: "lax", // "lax", nes slapukas dabar keliauja tarp keliu poddomeniu (app + api)
-      domain: ".smalllabs.lt", // galioja VISIEMS *.smalllabs.lt poddomeniams - viena paskyra visur
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 dienos
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      domain: ".smalllabs.lt",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
     res.json({ vartotojas: { id: vartotojas.id, email: vartotojas.email } });
@@ -156,7 +157,6 @@ app.post("/api/login", authLimiteris, async (req, res) => {
   }
 });
 
-// --- Pagalbine funkcija: patikrina, ar uzklausa ateina nuo prisijungusio vartotojo ---
 function reikalingasPrisijungimas(req, res, next) {
   const token = req.cookies.session;
   if (!token) {
@@ -171,7 +171,6 @@ function reikalingasPrisijungimas(req, res, next) {
   }
 }
 
-// --- Testinis apsaugotas endpoint'as - patikrinti, ar prisijungimas veikia ---
 app.get("/api/me", reikalingasPrisijungimas, async (req, res) => {
   try {
     const result = await pool.query("SELECT id, email, is_admin, created_at FROM users WHERE id = $1", [req.userId]);
@@ -185,17 +184,12 @@ app.get("/api/me", reikalingasPrisijungimas, async (req, res) => {
   }
 });
 
-// --- ATSIJUNGIMAS ---
 app.post("/api/logout", (req, res) => {
   res.clearCookie("session", { domain: ".smalllabs.lt" });
   res.json({ status: "ok" });
 });
 
 // --- DUOMENU SINCHRONIZACIJA ---
-// Sitie trys endpoint'ai atkartoja ta pati storage.getAll()/storage.set() principa,
-// kuri jau naudoja programele - todel programeles puseje pakeitimu reikes nedaug.
-
-// Gauti visus prisijungusio vartotojo duomenis is karto (naudojama programeles paleidimo metu, kaip boot()).
 app.get("/api/data", reikalingasPrisijungimas, async (req, res) => {
   try {
     const result = await pool.query("SELECT key, value FROM app_data WHERE user_id = $1", [req.userId]);
@@ -210,7 +204,6 @@ app.get("/api/data", reikalingasPrisijungimas, async (req, res) => {
   }
 });
 
-// Issaugoti viena konkretu rakta (naudojama kiekviena karta, kai programele daro storage.set()).
 app.put("/api/data/:key", reikalingasPrisijungimas, async (req, res) => {
   const { key } = req.params;
   const { value } = req.body;
@@ -232,9 +225,6 @@ app.put("/api/data/:key", reikalingasPrisijungimas, async (req, res) => {
   }
 });
 
-// Vienkartinis esamu (telefone sukauptu) duomenu perkelimas i serveri.
-// Programele ja iskvies TIK PIRMA KARTA, kai vartotojas prisijungia po perejimo i backend'a.
-// Niekada neperrasoma tuscia - jei vartotojas jau turi duomenu serveryje, naujesni islieka.
 app.post("/api/data/bulk-import", reikalingasPrisijungimas, async (req, res) => {
   const visiDuomenys = req.body;
   if (typeof visiDuomenys !== "object" || Array.isArray(visiDuomenys)) {
