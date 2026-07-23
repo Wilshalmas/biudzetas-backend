@@ -15,9 +15,29 @@ const express = require("express");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 
 const app = express();
+
+// CORS: leidziame uzklausas is BET KURIO *.smalllabs.lt poddomenio (ir paties smalllabs.lt),
+// kad viena paskyra veiktu visose programelese. Kitos kilmes (originai) atmetamos.
+function leidziamasOriginas(origin) {
+  if (!origin) return false;
+  return origin === "https://smalllabs.lt" || /^https:\/\/[a-z0-9-]+\.smalllabs\.lt$/.test(origin);
+}
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (leidziamasOriginas(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
+  res.header("Access-Control-Allow-Credentials", "true");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json());
 app.use(cookieParser());
 
@@ -56,8 +76,17 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
+// Apsauga nuo brute-force atakų: ne daugiau 10 bandymų per 15 min. is vieno IP.
+const authLimiteris = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { klaida: "Per daug bandymų. Pabandykite vėliau." },
+});
+
 // --- REGISTRACIJA ---
-app.post("/api/register", async (req, res) => {
+app.post("/api/register", authLimiteris, async (req, res) => {
   const { email, password } = req.body;
 
   if (!isValidEmail(email)) {
@@ -90,7 +119,7 @@ app.post("/api/register", async (req, res) => {
 });
 
 // --- PRISIJUNGIMAS ---
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", authLimiteris, async (req, res) => {
   const { email, password } = req.body;
 
   if (!isValidEmail(email) || typeof password !== "string") {
@@ -115,7 +144,8 @@ app.post("/api/login", async (req, res) => {
     res.cookie("session", token, {
       httpOnly: true, // kenkejiskas JS naršykleje negali perskaityti sio slapuko
       secure: true, // siunciamas tik per HTTPS
-      sameSite: "strict", // apsauga nuo CSRF atakų
+      sameSite: "lax", // "lax", nes slapukas dabar keliauja tarp keliu poddomeniu (app + api)
+      domain: ".smalllabs.lt", // galioja VISIEMS *.smalllabs.lt poddomeniams - viena paskyra visur
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 dienos
     });
 
@@ -157,8 +187,75 @@ app.get("/api/me", reikalingasPrisijungimas, async (req, res) => {
 
 // --- ATSIJUNGIMAS ---
 app.post("/api/logout", (req, res) => {
-  res.clearCookie("session");
+  res.clearCookie("session", { domain: ".smalllabs.lt" });
   res.json({ status: "ok" });
+});
+
+// --- DUOMENU SINCHRONIZACIJA ---
+// Sitie trys endpoint'ai atkartoja ta pati storage.getAll()/storage.set() principa,
+// kuri jau naudoja programele - todel programeles puseje pakeitimu reikes nedaug.
+
+// Gauti visus prisijungusio vartotojo duomenis is karto (naudojama programeles paleidimo metu, kaip boot()).
+app.get("/api/data", reikalingasPrisijungimas, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT key, value FROM app_data WHERE user_id = $1", [req.userId]);
+    const duomenys = {};
+    for (const eilute of result.rows) {
+      duomenys[eilute.key] = eilute.value;
+    }
+    res.json(duomenys);
+  } catch (err) {
+    console.error("Klaida /api/data (GET):", err.message);
+    res.status(500).json({ klaida: "Nepavyko gauti duomenų." });
+  }
+});
+
+// Issaugoti viena konkretu rakta (naudojama kiekviena karta, kai programele daro storage.set()).
+app.put("/api/data/:key", reikalingasPrisijungimas, async (req, res) => {
+  const { key } = req.params;
+  const { value } = req.body;
+  if (value === undefined) {
+    return res.status(400).json({ klaida: "Trūksta 'value' lauko." });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO app_data (user_id, key, value, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (user_id, key)
+       DO UPDATE SET value = $3, updated_at = NOW()`,
+      [req.userId, key, JSON.stringify(value)]
+    );
+    res.json({ status: "ok" });
+  } catch (err) {
+    console.error("Klaida /api/data/:key (PUT):", err.message);
+    res.status(500).json({ klaida: "Nepavyko išsaugoti." });
+  }
+});
+
+// Vienkartinis esamu (telefone sukauptu) duomenu perkelimas i serveri.
+// Programele ja iskvies TIK PIRMA KARTA, kai vartotojas prisijungia po perejimo i backend'a.
+// Niekada neperrasoma tuscia - jei vartotojas jau turi duomenu serveryje, naujesni islieka.
+app.post("/api/data/bulk-import", reikalingasPrisijungimas, async (req, res) => {
+  const visiDuomenys = req.body;
+  if (typeof visiDuomenys !== "object" || Array.isArray(visiDuomenys)) {
+    return res.status(400).json({ klaida: "Neteisingas duomenų formatas." });
+  }
+  try {
+    const raktai = Object.keys(visiDuomenys);
+    for (const key of raktai) {
+      await pool.query(
+        `INSERT INTO app_data (user_id, key, value, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (user_id, key)
+         DO UPDATE SET value = $3, updated_at = NOW()`,
+        [req.userId, key, JSON.stringify(visiDuomenys[key])]
+      );
+    }
+    res.json({ status: "ok", perkelta: raktai.length });
+  } catch (err) {
+    console.error("Klaida /api/data/bulk-import:", err.message);
+    res.status(500).json({ klaida: "Nepavyko perkelti duomenų." });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
