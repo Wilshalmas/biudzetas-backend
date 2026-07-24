@@ -184,15 +184,65 @@ app.get("/api/me", reikalingasPrisijungimas, async (req, res) => {
   }
 });
 
+// --- PASKYROS ISTRYNIMAS (GDPR) ---
+// Reikalauja slaptazodzio patvirtinimo saugumui - kad nepakaktu vien pavogto slapuko
+// istrinti visa paskyra. Istrinus useri, app_data eilutes issitrina automatiskai
+// (ON DELETE CASCADE), nes taip apibrezta lenteleje.
+app.delete("/api/account", reikalingasPrisijungimas, async (req, res) => {
+  const { password } = req.body;
+  if (typeof password !== "string") {
+    return res.status(400).json({ klaida: "Reikia patvirtinti slaptažodžiu." });
+  }
+  try {
+    const vartotojas = await pool.query("SELECT password_hash FROM users WHERE id = $1", [req.userId]);
+    if (vartotojas.rows.length === 0) {
+      return res.status(404).json({ klaida: "Vartotojas nerastas." });
+    }
+    const teisingas = await bcrypt.compare(password, vartotojas.rows[0].password_hash);
+    if (!teisingas) {
+      return res.status(401).json({ klaida: "Neteisingas slaptažodis." });
+    }
+    await pool.query("DELETE FROM users WHERE id = $1", [req.userId]);
+    res.clearCookie("session", { domain: ".smalllabs.lt" });
+    res.json({ status: "ok" });
+  } catch (err) {
+    console.error("Klaida /api/account (DELETE):", err.message);
+    res.status(500).json({ klaida: "Nepavyko ištrinti paskyros. Jei esi šeimos kūrėjas, pirma reikia perleisti ar ištrinti šeimą." });
+  }
+});
+
 app.post("/api/logout", (req, res) => {
   res.clearCookie("session", { domain: ".smalllabs.lt" });
   res.json({ status: "ok" });
 });
 
 // --- DUOMENU SINCHRONIZACIJA ---
+// Paprastas atvejis: grazina prisijungusio vartotojo duomenis.
+// Family Pack atvejis: jei "parent" prideda ?vartotojo_id=X ir X yra tos pacios seimos
+// narys, gauna TO nario duomenis (tik skaitymui, per si endpoint'a). Vaikai (child)
+// visada gauna tik savo duomenis, nesvarbu, ka iraso i ?vartotojo_id=.
 app.get("/api/data", reikalingasPrisijungimas, async (req, res) => {
   try {
-    const result = await pool.query("SELECT key, value FROM app_data WHERE user_id = $1", [req.userId]);
+    let tikslinisId = req.userId;
+    const prasomasId = req.query.vartotojo_id ? parseInt(req.query.vartotojo_id, 10) : null;
+
+    if (prasomasId && prasomasId !== req.userId) {
+      const manoDuomenys = await pool.query("SELECT family_id, role FROM users WHERE id = $1", [req.userId]);
+      const galiuZiuretiKitus = manoDuomenys.rows[0] && manoDuomenys.rows[0].role === "parent";
+      if (!galiuZiuretiKitus) {
+        return res.status(403).json({ klaida: "Neturi teisės matyti kito vartotojo duomenų." });
+      }
+      const tikslinisVartotojas = await pool.query("SELECT family_id FROM users WHERE id = $1", [prasomasId]);
+      const taPatiSeima =
+        tikslinisVartotojas.rows[0] &&
+        tikslinisVartotojas.rows[0].family_id === manoDuomenys.rows[0].family_id;
+      if (!taPatiSeima) {
+        return res.status(403).json({ klaida: "Šis vartotojas nepriklauso tavo šeimai." });
+      }
+      tikslinisId = prasomasId;
+    }
+
+    const result = await pool.query("SELECT key, value FROM app_data WHERE user_id = $1", [tikslinisId]);
     const duomenys = {};
     for (const eilute of result.rows) {
       duomenys[eilute.key] = eilute.value;
@@ -203,6 +253,84 @@ app.get("/api/data", reikalingasPrisijungimas, async (req, res) => {
     res.status(500).json({ klaida: "Nepavyko gauti duomenų." });
   }
 });
+// Sugeneruoja atsitiktini, lengvai perskaitoma kvietimo koda (pvz. "ABC123").
+function sugeneruotiKvietimoKoda() {
+  const raidesSkaiciai = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // be O/0/I/1, kad nesipainiotu
+  let kodas = "";
+  for (let i = 0; i < 6; i++) {
+    kodas += raidesSkaiciai[Math.floor(Math.random() * raidesSkaiciai.length)];
+  }
+  return kodas;
+}
+
+// Sukurti nauja seima. Prisijunges vartotojas tampa "parent" ir jos kurejas.
+app.post("/api/family/create", reikalingasPrisijungimas, async (req, res) => {
+  const { name } = req.body;
+  if (typeof name !== "string" || name.trim().length === 0) {
+    return res.status(400).json({ klaida: "Reikia šeimos pavadinimo." });
+  }
+  try {
+    const kvietimoKodas = sugeneruotiKvietimoKoda();
+    const seima = await pool.query(
+      "INSERT INTO families (name, invite_code, created_by) VALUES ($1, $2, $3) RETURNING id, name, invite_code",
+      [name.trim(), kvietimoKodas, req.userId]
+    );
+    await pool.query("UPDATE users SET family_id = $1, role = 'parent' WHERE id = $2", [
+      seima.rows[0].id,
+      req.userId,
+    ]);
+    res.status(201).json({ seima: seima.rows[0] });
+  } catch (err) {
+    console.error("Klaida /api/family/create:", err.message);
+    res.status(500).json({ klaida: "Nepavyko sukurti šeimos." });
+  }
+});
+
+// Prisijungti prie esamos seimos per kvietimo koda. Prisijungiantis visada tampa "child".
+app.post("/api/family/join", reikalingasPrisijungimas, async (req, res) => {
+  const { invite_code } = req.body;
+  if (typeof invite_code !== "string" || invite_code.trim().length === 0) {
+    return res.status(400).json({ klaida: "Reikia kvietimo kodo." });
+  }
+  try {
+    const seima = await pool.query("SELECT id, name FROM families WHERE invite_code = $1", [
+      invite_code.trim().toUpperCase(),
+    ]);
+    if (seima.rows.length === 0) {
+      return res.status(404).json({ klaida: "Toks kvietimo kodas nerastas." });
+    }
+    await pool.query("UPDATE users SET family_id = $1, role = 'child' WHERE id = $2", [
+      seima.rows[0].id,
+      req.userId,
+    ]);
+    res.json({ seima: seima.rows[0] });
+  } catch (err) {
+    console.error("Klaida /api/family/join:", err.message);
+    res.status(500).json({ klaida: "Nepavyko prisijungti prie šeimos." });
+  }
+});
+
+// Grazina seimos info ir jos nariu sarasa (matoma visiems seimos nariams).
+app.get("/api/family", reikalingasPrisijungimas, async (req, res) => {
+  try {
+    const vartotojas = await pool.query("SELECT family_id, role FROM users WHERE id = $1", [req.userId]);
+    if (!vartotojas.rows[0] || !vartotojas.rows[0].family_id) {
+      return res.status(404).json({ klaida: "Nepriklausai jokiai šeimai." });
+    }
+    const familyId = vartotojas.rows[0].family_id;
+    const seima = await pool.query("SELECT id, name, invite_code FROM families WHERE id = $1", [familyId]);
+    const nariai = await pool.query(
+      "SELECT id, email, role, created_at FROM users WHERE family_id = $1 ORDER BY role DESC, created_at ASC",
+      [familyId]
+    );
+    res.json({ seima: seima.rows[0], nariai: nariai.rows, mano_role: vartotojas.rows[0].role });
+  } catch (err) {
+    console.error("Klaida /api/family:", err.message);
+    res.status(500).json({ klaida: "Nepavyko gauti šeimos informacijos." });
+  }
+});
+
+
 
 app.put("/api/data/:key", reikalingasPrisijungimas, async (req, res) => {
   const { key } = req.params;
