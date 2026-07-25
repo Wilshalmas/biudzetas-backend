@@ -52,6 +52,7 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const BCRYPT_ROUNDS = 12;
+const FAMILY_NARIU_LIMITAS = 6; // maksimalus nariu skaicius vienoje seimoje, iskaitant kurusia ja
 
 if (!JWT_SECRET) {
   console.error("KLAIDA: trūksta JWT_SECRET aplinkos kintamojo. Serveris nesileis.");
@@ -299,6 +300,10 @@ app.post("/api/family/join", reikalingasPrisijungimas, async (req, res) => {
     if (seima.rows.length === 0) {
       return res.status(404).json({ klaida: "Toks kvietimo kodas nerastas." });
     }
+    const nariuSkaicius = await pool.query("SELECT COUNT(*)::int AS n FROM users WHERE family_id = $1", [seima.rows[0].id]);
+    if (nariuSkaicius.rows[0].n >= FAMILY_NARIU_LIMITAS) {
+      return res.status(400).json({ klaida: `Ši šeima jau pasiekė narių limitą (${FAMILY_NARIU_LIMITAS}).` });
+    }
     await pool.query("UPDATE users SET family_id = $1, role = 'child' WHERE id = $2", [
       seima.rows[0].id,
       req.userId,
@@ -377,7 +382,7 @@ app.delete("/api/family/member/:id", reikalingasPrisijungimas, async (req, res) 
     if (!tikslinisVartotojas.rows[0] || tikslinisVartotojas.rows[0].family_id !== manoDuomenys.rows[0].family_id) {
       return res.status(403).json({ klaida: "Šis vartotojas nepriklauso tavo šeimai." });
     }
-    await pool.query("UPDATE users SET family_id = NULL, role = NULL WHERE id = $1", [targetId]);
+    await pool.query("UPDATE users SET family_id = NULL WHERE id = $1", [targetId]);
     res.json({ status: "ok" });
   } catch (err) {
     console.error("Klaida /api/family/member/:id (DELETE):", err.message);
