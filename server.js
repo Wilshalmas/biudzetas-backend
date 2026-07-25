@@ -332,6 +332,35 @@ app.get("/api/family", reikalingasPrisijungimas, async (req, res) => {
 
 
 
+// Tevas/mama gali pakeisti kito seimos nario role (parent/child).
+// Savo paties roles per si endpoint'a pakeisti negalima (kad seima netyciom
+// neliktu be neivieno "parent" nario).
+app.patch("/api/family/member/:id/role", reikalingasPrisijungimas, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  const { role } = req.body;
+  if (role !== "parent" && role !== "child") {
+    return res.status(400).json({ klaida: "Role turi būti 'parent' arba 'child'." });
+  }
+  if (targetId === req.userId) {
+    return res.status(400).json({ klaida: "Negali pakeisti savo pačio rolės." });
+  }
+  try {
+    const manoDuomenys = await pool.query("SELECT family_id, role FROM users WHERE id = $1", [req.userId]);
+    if (!manoDuomenys.rows[0] || manoDuomenys.rows[0].role !== "parent") {
+      return res.status(403).json({ klaida: "Tik tėvas/mama gali keisti narių roles." });
+    }
+    const tikslinisVartotojas = await pool.query("SELECT family_id FROM users WHERE id = $1", [targetId]);
+    if (!tikslinisVartotojas.rows[0] || tikslinisVartotojas.rows[0].family_id !== manoDuomenys.rows[0].family_id) {
+      return res.status(403).json({ klaida: "Šis vartotojas nepriklauso tavo šeimai." });
+    }
+    await pool.query("UPDATE users SET role = $1 WHERE id = $2", [role, targetId]);
+    res.json({ status: "ok" });
+  } catch (err) {
+    console.error("Klaida /api/family/member/:id/role:", err.message);
+    res.status(500).json({ klaida: "Nepavyko pakeisti rolės." });
+  }
+});
+
 app.put("/api/data/:key", reikalingasPrisijungimas, async (req, res) => {
   const { key } = req.params;
   const { value } = req.body;
