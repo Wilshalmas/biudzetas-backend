@@ -361,6 +361,30 @@ app.patch("/api/family/member/:id/role", reikalingasPrisijungimas, async (req, r
   }
 });
 
+// Tevas/mama gali pasalinti nari is seimos (jo paskyra islieka, tik nebepriklauso seimai).
+// Savo paties negalima pasalinti per si endpoint'a.
+app.delete("/api/family/member/:id", reikalingasPrisijungimas, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  if (targetId === req.userId) {
+    return res.status(400).json({ klaida: "Negali pašalinti savęs iš šeimos." });
+  }
+  try {
+    const manoDuomenys = await pool.query("SELECT family_id, role FROM users WHERE id = $1", [req.userId]);
+    if (!manoDuomenys.rows[0] || manoDuomenys.rows[0].role !== "parent") {
+      return res.status(403).json({ klaida: "Tik tėvas/mama gali šalinti narius." });
+    }
+    const tikslinisVartotojas = await pool.query("SELECT family_id FROM users WHERE id = $1", [targetId]);
+    if (!tikslinisVartotojas.rows[0] || tikslinisVartotojas.rows[0].family_id !== manoDuomenys.rows[0].family_id) {
+      return res.status(403).json({ klaida: "Šis vartotojas nepriklauso tavo šeimai." });
+    }
+    await pool.query("UPDATE users SET family_id = NULL, role = NULL WHERE id = $1", [targetId]);
+    res.json({ status: "ok" });
+  } catch (err) {
+    console.error("Klaida /api/family/member/:id (DELETE):", err.message);
+    res.status(500).json({ klaida: "Nepavyko pašalinti nario." });
+  }
+});
+
 app.put("/api/data/:key", reikalingasPrisijungimas, async (req, res) => {
   const { key } = req.params;
   const { value } = req.body;
@@ -368,12 +392,32 @@ app.put("/api/data/:key", reikalingasPrisijungimas, async (req, res) => {
     return res.status(400).json({ klaida: "Trūksta 'value' lauko." });
   }
   try {
+    // Jei parent'as taiso vaiko duomenis (?vartotojo_id=), patikrinam, kad tikrai
+    // yra tevas ir tikslinis vartotojas priklauso tai paciai seimai - lygiai taip pat,
+    // kaip patikrinama skaitant duomenis per GET /api/data.
+    let tikslinisId = req.userId;
+    const prasomasId = req.query.vartotojo_id ? parseInt(req.query.vartotojo_id, 10) : null;
+    if (prasomasId && prasomasId !== req.userId) {
+      const manoDuomenys = await pool.query("SELECT family_id, role FROM users WHERE id = $1", [req.userId]);
+      const galiuRedaguotiKitus = manoDuomenys.rows[0] && manoDuomenys.rows[0].role === "parent";
+      if (!galiuRedaguotiKitus) {
+        return res.status(403).json({ klaida: "Neturi teisės redaguoti kito vartotojo duomenų." });
+      }
+      const tikslinisVartotojas = await pool.query("SELECT family_id FROM users WHERE id = $1", [prasomasId]);
+      const taPatiSeima =
+        tikslinisVartotojas.rows[0] &&
+        tikslinisVartotojas.rows[0].family_id === manoDuomenys.rows[0].family_id;
+      if (!taPatiSeima) {
+        return res.status(403).json({ klaida: "Šis vartotojas nepriklauso tavo šeimai." });
+      }
+      tikslinisId = prasomasId;
+    }
     await pool.query(
       `INSERT INTO app_data (user_id, key, value, updated_at)
        VALUES ($1, $2, $3, NOW())
        ON CONFLICT (user_id, key)
        DO UPDATE SET value = $3, updated_at = NOW()`,
-      [req.userId, key, JSON.stringify(value)]
+      [tikslinisId, key, JSON.stringify(value)]
     );
     res.json({ status: "ok" });
   } catch (err) {
