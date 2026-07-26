@@ -101,6 +101,17 @@ app.post("/api/register", authLimiteris, async (req, res) => {
     return res.status(400).json({ klaida: "Slaptažodis turi būti bent 8 simbolių." });
   }
 
+  // Kol programa testuojama, registracija leidziama tik is anksto patvirtintiems
+  // el. pastams (ALLOWED_REGISTER_EMAILS aplinkos kintamasis, atskirti kableliais).
+  // Jei sis kintamasis neisdefinuotas, registracija liks atvira visiems (senas veikimas).
+  const leidziamiEmailai = (process.env.ALLOWED_REGISTER_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  if (leidziamiEmailai.length > 0 && !leidziamiEmailai.includes(email.toLowerCase())) {
+    return res.status(403).json({ klaida: "Registracija šiuo metu uždaryta — programėlė vis dar testuojama." });
+  }
+
   try {
     const esamas = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
     if (esamas.rows.length > 0) {
